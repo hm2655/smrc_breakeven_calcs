@@ -1,0 +1,262 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Mar 30 09:34:33 2021
+
+@author: harshit.mahajan
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jul 28 09:55:47 2020
+
+@author: Harshit.Mahajan
+"""
+
+import pandas as pd
+import numpy as np 
+from datetime import datetime, date, timedelta 
+import time 
+import xlrd
+import matplotlib as plt 
+
+#Start the timer
+start = time.time()
+today = date.today()
+
+#File Path
+filePath = 'xxxx'
+fileName = 'xxxx.xlsx'
+fileRoute = filePath + fileName 
+
+# Reading the excel file 
+excelFile = pd.ExcelFile(fileRoute)
+sheetList = excelFile.sheet_names
+
+#Prices
+actualPrices = excelFile.parse('bbg_qry', header = None).iloc[3:,].reset_index(drop=True)
+actualPrices = actualPrices.iloc[:, [1,3,5,7,9,11,13]]
+actualPrices.columns = ['date_id','basis','ethane','propane','nbutane','ibutane','pentanes']
+actualPrices['date_id'] = pd.to_datetime(actualPrices['date_id'])
+actualPrices['butane'] = (actualPrices['nbutane']+ actualPrices['ibutane'])/2
+start_date = '2020-10-01'
+
+#Well Unshrunk Gas Prod
+production = excelFile.parse('Sheet3',header=0).iloc[:,0:22].dropna().reset_index(drop=True)
+wellProd = pd.melt(production, id_vars = ['Bucket','Asset','Type Curve','shrunkgas','unshrunkgas','ethane',
+                                          'propane','butane','pentane','liquids', 'hc','ethane_yield','propane_yield','butane_yield',
+                                          'pentane_yield','shrinkage','gor','type','date_id'], var_name=['date_id'], value_name='unshrunkgas')
+wellProd = production
+#wellProd = wellProd[wellProd['date_id'] > start_date]
+#wellProd = wellProd[wellProd['date_id'] == '2020-03-01']
+#wellProd = wellProd[wellProd['shrinkage'] > 0.12].reset_index(drop=True)
+wellProd = wellProd[wellProd['unshrunkgas'] > 0].reset_index(drop=True)
+
+midstream_margin = 0.65
+
+#Lean Gas 
+ep_lean_gas_cost = 0.523 
+midstream_lean_gas_fee = 0.424
+
+lean_wells = wellProd[wellProd['type']=='Lean']
+well_lean_list = lean_wells.Asset.unique()
+
+all_lean_wells = pd.DataFrame()
+
+price_list  = np.linspace(-1,1,41)
+
+for basis_prices in price_list:    
+    
+    tempDf = lean_wells 
+        
+    tempDf  = pd.merge(tempDf, actualPrices[['date_id','basis','ethane','propane','butane',
+                                             'pentanes']], how='left',left_on='date_id', right_on='date_id').reset_index(drop=True)
+        
+    tempDf['days'] = tempDf['date_id'].dt.daysinmonth
+        
+    tempDf['leanGas'] = tempDf['unshrunkgas'] * (1-tempDf['shrinkage'])
+        
+    tempDf['ethane_yield'] = tempDf['unshrunkgas'] * tempDf['ethane_x']
+    tempDf['propane_yield'] = tempDf['unshrunkgas'] * tempDf['propane_x']
+    tempDf['butane_yield'] = tempDf['unshrunkgas'] * tempDf['butane_x']
+    tempDf['pentane_yield'] = tempDf['unshrunkgas'] * tempDf['pentane']
+        
+    tempDf['liquids_yield'] = tempDf['ethane_yield'] + tempDf['propane_yield'] + tempDf['butane_yield'] + tempDf['pentane_yield']
+    ## EP Total Cost
+    tempDf['total_cost'] = (tempDf['unshrunkgas']* ep_lean_gas_cost)*tempDf['days']/1000000
+    
+    ## Midstream Rev
+    tempDf['total_midstream_rev'] = (tempDf['unshrunkgas'] * midstream_lean_gas_fee)*tempDf['days']/1000000
+                
+    ## Total Sales Rev
+    tempDf['total_sales_rev'] = (tempDf['leanGas'] * basis_prices)*tempDf['days']/1000000
+        
+    tempDf['gas_net'] = np.where(basis_prices<0, tempDf['leanGas'] * basis_prices / 0.975 * tempDf['days']/1000000, 
+                                 (tempDf['leanGas'] * basis_prices / 0.975 * tempDf['days']/1000000 * 0.75))
+        
+    tempDf['liquids_net'] = 0
+        
+    tempDf['net_sales'] = tempDf['gas_net'] + tempDf['liquids_net']
+        
+    tempDf['ep_net_income'] = - tempDf['total_cost'] + tempDf['total_midstream_rev'] * 0.79 * midstream_margin + tempDf['net_sales']
+                            
+    tempDf['price_type'] = basis_prices
+    
+    all_lean_wells = all_lean_wells.append(tempDf)
+    print(basis_prices)
+
+
+positive_prod_lean = all_lean_wells[(all_lean_wells['ep_net_income'] > 0)]
+
+bkvn_values_lean = positive_prod_lean.groupby(['Bucket','Asset', 'Type Curve', 'ethane_yield', 'propane_yield', 'butane_yield',
+                                     'pentane_yield', 'shrinkage', 'unshrunkgas','shrunkgas', 'liquids_yield']).min()['price_type'].reset_index()
+
+bkvn_values_lean = bkvn_values_lean.sort_values(by=['price_type','unshrunkgas'], ascending= False).reset_index(drop=True)
+bkvn_values_lean['sumproduct'] = bkvn_values_lean['price_type'] * bkvn_values_lean ['unshrunkgas']
+
+asdf_lean = bkvn_values_lean.groupby(['Bucket']).sum()[['unshrunkgas', 'sumproduct']]
+asdf_lean['bkvn'] = asdf_lean['sumproduct'] / asdf_lean['unshrunkgas'] 
+
+
+########################
+####### gold Gas #######
+ep_gas_cost = 0.956
+midstream_gas_fee = 0.816
+ep_liquids_cost = 4.207
+midstream_liquids_fee = 0.196
+hc_price = 55
+
+gold_wells = wellProd[(wellProd['type']=='gold') | (wellProd['type']=='hc')]
+well_gold_list = gold_wells.Asset.unique()
+
+all_gold_wells = pd.DataFrame()
+
+price_list  = np.linspace(-10,1,41)
+mode_list = [0.0, 0.8]
+
+for mode in mode_list:
+    for basis_prices in price_list:
+        #tempDf = gold_wells[gold_wells['Asset'] == i] 
+        tempDf = gold_wells
+        tempDf = pd.merge(tempDf, actualPrices[['date_id','basis','ethane','propane','butane','pentanes']], 
+                          how='left',left_on='date_id', right_on='date_id').reset_index(drop=True)
+        
+        tempDf['days'] = tempDf['date_id'].dt.daysinmonth
+
+        rejection_rate = mode
+        
+        tempDf['leanGas'] = tempDf['unshrunkgas'] * (1-tempDf['shrinkage'])
+        
+        tempDf['ethane_barrels'] = tempDf['unshrunkgas'] * tempDf ['ethane_yield'] * (1-rejection_rate)
+        tempDf['propane_barrels'] = tempDf['unshrunkgas'] * tempDf ['propane_yield']
+        tempDf['butane_barrels'] = tempDf['unshrunkgas'] * tempDf ['butane_yield'] 
+        tempDf['pentane_barrels'] = tempDf['unshrunkgas'] * tempDf ['pentane_yield']
+        
+        tempDf['liquids_base_barrels'] = tempDf['liquids']
+        
+        tempDf['liquids_barrels'] = tempDf['ethane_barrels'] + tempDf['propane_barrels'] + tempDf['butane_barrels'] + tempDf['pentane_barrels'] 
+                
+        tempDf['shrinkage_mcf'] = (tempDf['ethane_barrels'] * 42 * 0.037401 +
+                                    tempDf['propane_barrels'] * 42 * 0.036307 +
+                                    tempDf['butane_barrels'] * 42 * 0.030566 +
+                                    tempDf['pentane_barrels'] * 42 * 0.031728)
+                    
+        tempDf['residue_gas'] = tempDf['unshrunkgas'] - tempDf['shrinkage_mcf']
+        
+        ## EP Total Cost
+        tempDf['total_cost'] = (tempDf['unshrunkgas'] * ep_gas_cost + tempDf['liquids_barrels'] * ep_liquids_cost)*tempDf['days']/1000000
+        
+        ## Midstream Rev
+        tempDf['total_midstream_rev'] = (tempDf['unshrunkgas'] * midstream_gas_fee + tempDf['liquids_barrels'] * midstream_liquids_fee)*tempDf['days']/1000000
+                
+        ## Total Sales Rev
+        tempDf['total_sales_rev'] = (tempDf['leanGas'] * basis_prices / 0.975 +
+                                      tempDf['ethane_barrels']* tempDf['ethane_y'] * 42 + 
+                                      tempDf['propane_barrels'] * tempDf['propane_y']*42 + 
+                                      tempDf['butane_barrels']*tempDf['butane_y']*42 + 
+                                      tempDf['pentane_barrels']*tempDf['pentanes']*42) * tempDf['days']/1000000
+                      
+        tempDf['gas_net'] = np.where(basis_prices < 0, tempDf['leanGas'] * basis_prices * tempDf['days']/1000000 / 0.975, 
+                                     (tempDf['leanGas'] * basis_prices * tempDf['days']/1000000 * 0.75 / 0.975))
+                      
+        tempDf['liquids_net'] = (tempDf['ethane_barrels']* tempDf['ethane_y']*42 + 
+                                      tempDf['propane_barrels'] * tempDf['propane_y']*42 + 
+                                      tempDf['butane_barrels']*tempDf['butane_y']*42 + 
+                                      tempDf['pentane_barrels']*tempDf['pentanes']*42) * 0.75 * tempDf['days']/1000000
+                            
+        #tempDf['hc_net'] = tempDf['hc'] * tempDf['gor'] /tempDf['unshrunkgas']  * hc_price * 0.75 * tempDf['days'] / 1000000
+        
+        tempDf['net_sales'] = tempDf['gas_net'] + tempDf['liquids_net'] 
+                            
+        tempDf['ep_net_income'] = tempDf['net_sales'] - tempDf['total_cost'] + tempDf['total_midstream_rev'] * 0.79 * midstream_margin
+        
+        tempDf['price_type'] = basis_prices - tempDf['gor'] * hc_price
+        
+        tempDf['mode'] = mode
+        
+        all_gold_wells = all_gold_wells.append(tempDf)
+                           
+        print(basis_prices)
+    
+all_gold_wells = all_gold_wells[['Bucket','Asset','Type Curve','price_type','unshrunkgas','shrunkgas','residue_gas',
+                                 'ethane_barrels','shrinkage', 'propane_barrels','butane_barrels','pentane_barrels','liquids_barrels',
+                                 'liquids_base_barrels','mode','hc', 'gor', 'ep_net_income']]
+
+positive_prod_gold = all_gold_wells[(all_gold_wells['ep_net_income'] > 0)]
+
+
+# Breakeven Calcs
+bkvn_values_gold = positive_prod_gold.groupby(['Bucket','Asset', 'Type Curve', 'ethane_barrels', 'propane_barrels', 'butane_barrels',
+                                     'pentane_barrels', 'shrinkage', 'unshrunkgas','mode','liquids_barrels',
+                                     'residue_gas', 'shrunkgas']).min()['price_type'].reset_index()
+                                     
+bkvn_values_gold = bkvn_values_gold.sort_values(by=['price_type','unshrunkgas'], ascending= False).reset_index(drop=True)
+bkvn_values_gold['sumproduct'] = bkvn_values_gold['price_type'] * bkvn_values_gold['unshrunkgas']
+asdf_gold = bkvn_values_gold.groupby(['Bucket','mode']).sum()[['unshrunkgas', 'sumproduct']]
+asdf_gold['bkvn'] = asdf_gold['sumproduct'] / asdf_gold['unshrunkgas'] 
+
+bkvn_all = asdf_lean.append(asdf_gold, ignore_index = False).reset_index(drop=False)
+bkvn_all.columns = ['stream_type','unshrunkgas','sumproduct','bkvn_price']
+
+lean_output = bkvn_values_lean[['Bucket', 'Asset', 'Type Curve', 'price_type', 'unshrunkgas', 'shrunkgas', 'ethane_yield',
+                                  'propane_yield', 'butane_yield', 'pentane_yield', 'liquids_yield']]
+lean_output['mode'] = 'Lean Gas'
+
+lean_output.columns = ['Bucket', 'Asset', 'Type Curve', 'price_type', 'unshrunkgas', 'shrunkgas', 'ethane_barrels',
+                                  'propane_barrels', 'butane_barrels', 'pentane_barrels', 'liquids_barrels', 'mode']
+
+
+gold_output = bkvn_values_gold[['Bucket','Asset', 'Type Curve','price_type','unshrunkgas','shrunkgas','ethane_barrels',
+                                  'propane_barrels','butane_barrels','pentane_barrels','liquids_barrels', 'mode','residue_gas']] 
+
+
+gold_rejection = gold_output[gold_output['mode'] == 0.8][['Bucket','Asset','Type Curve','price_type','unshrunkgas','shrunkgas',
+                                                          'ethane_barrels','propane_barrels','butane_barrels','pentane_barrels',
+                                                          'liquids_barrels']]
+
+gold_recovery = gold_output[gold_output['mode'] == 0][['Bucket','Asset','Type Curve','price_type','unshrunkgas','shrunkgas',
+                                                       'ethane_barrels','propane_barrels','butane_barrels','pentane_barrels',
+                                                       'liquids_barrels']]
+
+total_rejection_output = gold_rejection.append(lean_output[['Bucket', 'Asset', 'Type Curve', 'price_type', 'unshrunkgas', 'shrunkgas', 
+                                        'ethane_barrels','propane_barrels', 'butane_barrels', 'pentane_barrels', 
+                                        'liquids_barrels']], ignore_index = False).reset_index(drop=False)
+
+total_recovery_output = gold_recovery.append(lean_output[['Bucket', 'Asset', 'Type Curve', 'price_type', 'unshrunkgas', 'shrunkgas', 
+                                        'ethane_barrels','propane_barrels', 'butane_barrels', 'pentane_barrels', 
+                                        'liquids_barrels']], ignore_index = False).reset_index(drop=False)
+
+######################################################################
+######## Saving the output ###########################################
+path = 'xxxx'
+name = 'xxxx' + str(today) + '.xlsx'
+filepath = path + name 
+    
+dfs = {'all_wells_bkvn_df':bkvn_all, 'lean_wells_bkvn':lean_output, 'gold_wells_bkvn':gold_output}
+
+writer = pd.ExcelWriter(filepath, engine = 'xlsxwriter')
+for sheetname in dfs.keys():
+    print(sheetname)
+    dfs[sheetname].to_excel(writer, sheet_name=sheetname, index = False)
+writer.save()    
+##############################################################################
+##############################################################################
